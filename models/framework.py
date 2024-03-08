@@ -80,7 +80,7 @@ class FewShotREFramework:
         return: Checkpoint dict
         '''
         if os.path.isfile(ckpt):
-            checkpoint = torch.load(ckpt)
+            checkpoint = torch.load(ckpt, map_location="cpu")
             print("Successfully loaded checkpoint '%s'" % ckpt)
             return checkpoint
         else:
@@ -137,30 +137,21 @@ class FewShotREFramework:
         '''
         print("Start training...")
     
-        # Init
-        if bert_optim:
-            print('Use bert optim!')
-            parameters_to_optimize = list(model.named_parameters())
-            no_decay = ['bias', 'LayerNorm.bias', 'LayerNorm.weight']
-            parameters_to_optimize = [
-                {'params': [p for n, p in parameters_to_optimize 
-                    if not any(nd in n for nd in no_decay)], 'weight_decay': 0.01},
-                {'params': [p for n, p in parameters_to_optimize
-                    if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
-                ]
-            optimizer = AdamW(parameters_to_optimize, lr=2e-5, correct_bias=False)
-            if self.adv:
-                optimizer_encoder = AdamW(parameters_to_optimize, lr=1e-5, correct_bias=False)
-            scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=warmup_step, num_training_steps=train_iter) 
-        else:
-            optimizer = pytorch_optim(model.parameters(),
-                    learning_rate, weight_decay=weight_decay)
-            if self.adv:
-                optimizer_encoder = pytorch_optim(model.parameters(), lr=adv_enc_lr)
-            scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=lr_step_size)
 
+        print('Use bert optim!')
+        parameters_to_optimize = list(model.named_parameters())
+        no_decay = ['bias', 'LayerNorm.bias', 'LayerNorm.weight']
+        parameters_to_optimize = [
+            {'params': [p for n, p in parameters_to_optimize 
+                if not any(nd in n for nd in no_decay)], 'weight_decay': 0.01},
+            {'params': [p for n, p in parameters_to_optimize
+                if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
+            ]
+        optimizer = AdamW(parameters_to_optimize, lr=2e-5, correct_bias=False)
         if self.adv:
-            optimizer_dis = pytorch_optim(self.d.parameters(), lr=adv_dis_lr)
+            optimizer_encoder = AdamW(parameters_to_optimize, lr=1e-5, correct_bias=False)
+        scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=warmup_step, num_training_steps=train_iter) 
+
 
         if load_ckpt:
             state_dict = self.__load_model__(load_ckpt)['state_dict']
@@ -190,29 +181,10 @@ class FewShotREFramework:
         iter_right_dis = 0.0
         iter_sample = 0.0
         for it in range(start_iter, start_iter + train_iter):
-
-
-            if pair:
-
-                batch, label = next(self.train_data_loader)
-
+            batch, label = next(self.train_data_loader)
+            logits, pred = model(batch, N_for_train, K, 
+                    Q * N_for_train + na_rate * Q)
       
-                logits, pred = model(batch, N_for_train, K, 
-                        Q * N_for_train + na_rate * Q)
-      
-            else:
-                support, query, label = next(self.train_data_loader)
-                if torch.cuda.is_available() and False:
-                    for k in support:
-                        support[k] = support[k].cuda()
-                    for k in query:
-                        query[k] = query[k].cuda()
-                    label = label.cuda()
-        
-
-                model(support, token_type_ids=query, labels=label)
-                logits, pred  = model(support, query, 
-                        N_for_train, K, Q * N_for_train + na_rate * Q)
             logits=logits.cpu()
             pred=pred.cpu()
             loss = model.loss(logits, label) / float(grad_iter)
@@ -229,55 +201,16 @@ class FewShotREFramework:
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()
-            
-            # Adv part
-            if self.adv:
-                support_adv = next(self.adv_data_loader)
-                if torch.cuda.is_available()and False:
-                    for k in support_adv:
-                        support_adv[k] = support_adv[k].cuda()
-
-                features_ori = model.sentence_encoder(support)
-                features_adv = model.sentence_encoder(support_adv)
-                features = torch.cat([features_ori, features_adv], 0) 
-                total = features.size(0)
-                dis_labels = torch.cat([torch.zeros((total//2)).long().cuda(),
-                    torch.ones((total//2)).long().cuda()], 0)
-                dis_logits = self.d(features)
-                loss_dis = self.adv_cost(dis_logits, dis_labels)
-                _, pred = dis_logits.max(-1)
-                right_dis = float((pred == dis_labels).long().sum()) / float(total)
-                
-                loss_dis.backward(retain_graph=True)
-                optimizer_dis.step()
-                optimizer_dis.zero_grad()
-                optimizer_encoder.zero_grad()
-
-                loss_encoder = self.adv_cost(dis_logits, 1 - dis_labels)
-    
-                loss_encoder.backward(retain_graph=True)
-                optimizer_encoder.step()
-                optimizer_dis.zero_grad()
-                optimizer_encoder.zero_grad()
-
-                iter_loss_dis += self.item(loss_dis.data)
-                iter_right_dis += right_dis
 
             iter_loss += self.item(loss.data)
             iter_right += self.item(right.data)
             iter_sample += 1
-            if self.adv:
-                sys.stdout.write('step: {0:4} | loss: {1:2.6f}, accuracy: {2:3.2f}%, dis_loss: {3:2.6f}, dis_acc: {4:2.6f}'
-                    .format(it + 1, iter_loss / iter_sample, 
-                        100 * iter_right / iter_sample,
-                        iter_loss_dis / iter_sample,
-                        100 * iter_right_dis / iter_sample) +'\r')
-            else:
-                if ((it+1) % 1 == 0):
-                    print('step: {0:4} | loss: {1:2.6f}, accuracy: {2:3.2f}%'.format(it + 1, iter_loss / iter_sample, 100 * iter_right / iter_sample) +'\r')
+          
+    
+            if ((it+1) % 100 == 0):
+                print('step: {0:4} | loss: {1:2.6f}, accuracy: {2:3.2f}%'.format(it + 1, iter_loss / iter_sample, 100 * iter_right / iter_sample) +'\r')
             #sys.stdout.flush()
-
-            if (it + 100) % val_step == 0:
+            if it % val_step == 0:
                 print('-------------------------------')
                 print('Evaluation with evaluation data')
                 acc = self.eval(model, B, N_for_eval, K, Q, val_iter, 
@@ -294,9 +227,14 @@ class FewShotREFramework:
                 iter_right = 0.
                 iter_right_dis = 0.
                 iter_sample = 0.
-                
+            
         print("\n####################\n")
         print("Finish training " + model_name)
+
+        print('Evaluation with Test data')
+        acc_test = self.eval(model, B, N_for_eval, K, Q, test_iter, ckpt=save_ckpt,
+                na_rate=na_rate, pair=pair, shouldTest=True )
+        print('Test accuracy: %f' % acc_test)
 
     def eval(self,
             model,
@@ -304,7 +242,9 @@ class FewShotREFramework:
             eval_iter,
             na_rate=0,
             pair=False,
-            ckpt=None): 
+            ckpt=None,
+            shouldTest= False,
+        ): 
         '''
         model: a FewShotREModel instance
         B: Batch size
@@ -318,7 +258,7 @@ class FewShotREFramework:
         #print("")
         
         model.eval()
-        if ckpt is None:
+        if not shouldTest: # ckpt is None:
             eval_dataset = self.val_data_loader
         else:
             state_dict = self.__load_model__(ckpt)['state_dict']
@@ -333,29 +273,19 @@ class FewShotREFramework:
         iter_sample = 0.0
         with torch.no_grad():
             for it in range(eval_iter):
-                if pair:
-                    batch, label = next(eval_dataset)
-                    if torch.cuda.is_available()and False:
-                        for k in batch:
-                            batch[k] = batch[k].cuda()
-                        label = label.cuda()
-                    logits, pred = model(batch, N, K, Q * N + Q * na_rate)
-                else:
-                    support, query, label = next(eval_dataset)
-                    if torch.cuda.is_available()and False:
-                        for k in support:
-                            support[k] = support[k].cuda()
-                        for k in query:
-                            query[k] = query[k].cuda()
-                        label = label.cuda()
-                    logits, pred = model(support, query, N, K, Q * N + Q * na_rate)
+               
+                batch, label = next(eval_dataset)
+                
+                logits, pred = model(batch, N, K, Q * N + Q * na_rate)
+               
                 label=label.cpu()
                 pred=pred.cpu()
                 right = model.accuracy(pred, label)
                 iter_right += self.item(right.data)
                 iter_sample += 1
+                text = "TEST" if shouldTest else "EVAL"
                 if ((it+1) % 100 == 0):
-                    print('[EVAL] step: {0:4} | accuracy: {1:3.2f}%'.format(it + 1, 100 * iter_right / iter_sample) +'\r')
+                    print('[{0}] step: {1:4} | accuracy: {2:3.2f}%'.format(text, it + 1, 100 * iter_right / iter_sample) +'\r')
                 #sys.stdout.flush()
             #print("")
         return iter_right / iter_sample
